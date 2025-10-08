@@ -1,0 +1,14 @@
+[package]
+name = "validate-mysql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mysql = "*"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rust_xlsxwriter = "0.64"   
+itertools = "0.12"
+regex = "1"
+url = "2.5"
