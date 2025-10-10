@@ -36,7 +36,7 @@ struct Args {
     #[arg(short = 'u', long, default_value = "root", help = "MySQL 主机账号")]
     user: String,
 
-    #[arg(short = 'P', long, default_value_t = 3306, help = "MySQL 主机端口")]
+    #[arg(short = 'P', long, default_value_t = 0, help = "MySQL 主机端口")]
     port: i32,
 
     #[arg(short = 'p', long, default_value = "123456", help = "MySQL 主机密码")]
@@ -66,7 +66,7 @@ struct DBInfo {
 
 // 编码字符串
 fn encode_str(s: &str) -> String {
-    return form_urlencoded::byte_serialize(s.as_bytes()).collect();
+    form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
 // 获取一个数据库下所有表名称数组
@@ -310,23 +310,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.create {
         // 如果是创建数据缓存信息，则默认为 48 mysql
         let db_host = if args.host.is_empty() {
-            "localhost".into()
+            "10.31.7.48".into()
         } else {
             args.host
         };
         let db_port = if args.port == 0 { 3306 } else { args.port };
         let db_user = if args.user.is_empty() {
-            "root".into()
+            "chkd".into()
         } else {
             args.user
         };
         let db_pass = if args.password.is_empty() {
-            "123456".into()
+            "Chkd@146.48".into()
         } else {
             args.password
         };
         let db_db = if args.database.is_empty() {
-            "p10".into()
+            "yyws_xyzl_view".into()
         } else {
             args.database
         };
@@ -339,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // 编码密码
-        let db_pass =  encode_str(db_pass.as_str());
+        let db_pass = encode_str(db_pass.as_str());
 
         // 连接字符串
         let con_str = format!("mysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_db}");
@@ -370,17 +370,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let db_port = if args.port == 0 { 3306 } else { args.port };
         let db_user = if args.user.is_empty() {
-            "root".into()
+            "yywsxyzl".into()
         } else {
             args.user
         };
         let db_pass = if args.password.is_empty() {
-            "123456".into()
+            "xyzl2@24".into()
         } else {
             args.password
         };
         let db_db = if args.database.is_empty() {
-            "p10".into()
+            "yyws_xyzl_view".into()
         } else {
             args.database
         };
@@ -410,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // 编码密码
-        let db_pass =  encode_str(db_pass.as_str());
+        let db_pass = encode_str(db_pass.as_str());
 
         // 连接字符串
         let con_str = format!("mysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_db}");
