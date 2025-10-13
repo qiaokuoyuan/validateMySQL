@@ -1,8 +1,7 @@
 use bincode::{deserialize, serialize};
 use clap::Parser;
-use itertools::Itertools;
-use mysql::prelude::*;
-use mysql::*;
+use mysql_async::prelude::*;
+use mysql_async::*;
 use regex::Regex;
 use rust_xlsxwriter::Workbook;
 use serde::{Deserialize, Serialize};
@@ -25,25 +24,28 @@ struct Args {
     #[arg(short, long, default_value_t = false, help = "基于缓存验证标结构模式")]
     validate: bool,
 
-    #[arg(
-        short = 'H',
-        long,
-        default_value = "localhost",
-        help = "MySQL 主机地址"
-    )]
+    #[arg(short = 'H', long, default_value = "", help = "MySQL 主机地址")]
     host: String,
 
-    #[arg(short = 'u', long, default_value = "root", help = "MySQL 主机账号")]
+    #[arg(short = 'u', long, default_value = "", help = "MySQL 主机账号")]
     user: String,
 
     #[arg(short = 'P', long, default_value_t = 0, help = "MySQL 主机端口")]
-    port: i32,
+    port: u16,
 
-    #[arg(short = 'p', long, default_value = "123456", help = "MySQL 主机密码")]
+    #[arg(short = 'p', long, default_value = "", help = "MySQL 主机密码")]
     password: String,
 
-    #[arg(short = 'd', long, default_value = "p10", help = "MySQL 主机库名")]
+    #[arg(short = 'd', long, default_value = "", help = "MySQL 主机库名")]
     database: String,
+
+    #[arg(
+        short = 'x',
+        long,
+        default_value_t = false,
+        help = "输出修补sql文件位置，注意：只会生成修补列的sql"
+    )]
+    fix_lost_cols: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -52,6 +54,7 @@ struct ColInfo {
     col_type: String,
     is_nullable: String,
 }
+
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 struct TableInfo {
     table_name: String,
@@ -64,369 +67,303 @@ struct DBInfo {
     table_infos: Vec<TableInfo>,
 }
 
-// 编码字符串
 fn encode_str(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-// 获取一个数据库下所有表名称数组
-fn get_db_table_names(con: &mut PooledConn, db_name: String) -> Result<Vec<String>> {
-    // 生成查询表sql
+/* ---------- 数据库访问层（异步） ---------- */
+async fn get_db_table_names(conn: &mut Conn, db_name: &str) -> Result<Vec<String>> {
     let sql = format!(
-        "SELECT DISTINCT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '{db_name}'"
+        "SELECT DISTINCT TABLE_NAME \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = '{}'",
+        db_name
     );
-
-    con.query_map(&sql, |a| a)
+    conn.query(sql).await
 }
 
-// 获取一个表的信息
-fn get_table_info(con: &mut PooledConn, db_name: String, table_name: String) -> Result<TableInfo> {
+async fn get_table_info(conn: &mut Conn, db_name: &str, table_name: &str) -> Result<TableInfo> {
     let sql = format!(
-        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.COLUMNS WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME= '{table_name}'"
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'",
+        db_name, table_name
     );
-
-    // Let's select payments from database. Type inference should do the trick here.
-    let col_infos = con.query_map(sql, |(col_name, col_type, is_nullable)| ColInfo {
-        col_name,
-        col_type,
-        is_nullable,
-    })?;
-
+    let col_infos: Vec<ColInfo> = conn
+        .query(sql)
+        .await?
+        .into_iter()
+        .map(|(col_name, col_type, is_nullable)| ColInfo {
+            col_name,
+            col_type,
+            is_nullable,
+        })
+        .collect();
     Ok(TableInfo {
-        table_name,
+        table_name: table_name.to_string(),
         col_infos,
     })
 }
 
-// 获取一个数据库的信息
-fn get_db_info(con: &mut PooledConn, db_name: String) -> DBInfo {
-    // 获取当前数据库下所有表名
-    let table_names = get_db_table_names(con, db_name.clone()).unwrap();
-
-    // 存储每个表的信息
-    let mut table_infos: Vec<TableInfo> = Vec::new();
-
-    table_names.iter().for_each(|table_name| {
-        let table_info = get_table_info(con, db_name.clone(), table_name.clone()).unwrap();
-        table_infos.push(table_info);
-    });
-
-    DBInfo {
-        db_name,
-        table_infos,
+async fn get_db_info(conn: &mut Conn, db_name: &str) -> Result<DBInfo> {
+    let table_names = get_db_table_names(conn, db_name).await?;
+    let mut table_infos = Vec::new();
+    for table_name in table_names {
+        table_infos.push(get_table_info(conn, db_name, &table_name).await?);
     }
+    Ok(DBInfo {
+        db_name: db_name.to_string(),
+        table_infos,
+    })
 }
 
-// 将一个数据库的信息写入到本地文件
-fn write_db_info_to_files(
-    db_info: DBInfo,
-    output_dir: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+/* ---------- 业务逻辑（异步） ---------- */
+async fn create_db_info(pool: &Pool, db_name: String, output_path: String) -> Result<()> {
+    let mut conn = pool.get_conn().await?;
+    let db_info = get_db_info(&mut conn, &db_name).await?;
     let bytes = serialize(&db_info).unwrap();
-    fs::write(output_dir, bytes)?;
+    fs::write(output_path, bytes)?;
     Ok(())
 }
 
-fn create_db_info(con: &mut PooledConn, db_name: String, output_dir: String) {
-    let db_info = get_db_info(con, db_name);
-    write_db_info_to_files(db_info, output_dir).expect("TODO: panic message");
-}
-
-// 验证信息是否正确
-fn validate_db_info(
-    con: &mut PooledConn,
+async fn validate_db_info(
+    pool: &Pool,
     db_name: String,
-    cache_file_dir: String,
-    output_dir: String,
-) {
-    println!("reading cache file: {}", cache_file_dir);
+    cache_file: String,
+    output_xlsx: String,
+    fix_lost_cols: bool,
+) -> Result<()> {
+    let mut conn = pool.get_conn().await?;
+    let current = get_db_info(&mut conn, &db_name).await?;
+    let cached: DBInfo = deserialize(&fs::read(cache_file)?).unwrap();
 
-    // 读取缓存的数据库信息
-    let read_result = fs::read(cache_file_dir);
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    let mut row = 0;
 
-    // 检查是否缓存文件能正常读取
-    match read_result {
-        Ok(bytes) => {
-            // 读取当前数据库的信息
-            let current_db_info = get_db_info(con, db_name.clone());
+    let mut write_row = |c1: &str, c2: &str, c3: &str, c4: &str, c5: &str| {
+        ws.write_string(row, 0, c1).unwrap();
+        ws.write_string(row, 1, c2).unwrap();
+        ws.write_string(row, 2, c3).unwrap();
+        ws.write_string(row, 3, c4).unwrap();
+        ws.write_string(row, 4, c5).unwrap();
+        row += 1;
+    };
 
-            // 读取缓存的数据库信息
-            let cached_db_info: DBInfo = deserialize(&bytes).unwrap();
+    write_row("数据库", "表名", "列名", "比较结果", "比较信息");
 
-            // 将2个库信息中的表 union 起来
-            let mut union_table_names = HashSet::new();
-            for d in [&cached_db_info, &current_db_info] {
-                for t in &d.table_infos {
-                    let table_name = &t.table_name;
-                    if !union_table_names.contains(table_name) {
-                        union_table_names.insert(table_name.clone());
-                    }
-                }
-            }
+    let all_tables: HashSet<_> = cached
+        .table_infos
+        .iter()
+        .chain(current.table_infos.iter())
+        .map(|t| &t.table_name)
+        .collect();
 
-            // 新建excel写入文件
-            let mut wb = Workbook::new();
-            // 2. 添加工作表
-            let worksheet = wb.add_worksheet();
+    // 修补列的sql计集合
+    let mut fix_cols_sqls = vec![];
 
-            // 当前 excel 写入文件行号
-            let mut excel_row_index = 0;
+    // 比较每一张表
+    for tbl in all_tables {
+        // 缓存表
+        let cached_tbl = cached.table_infos.iter().find(|t| {
+            let table_name = t.table_name.to_lowercase();
+            tbl.to_lowercase() == table_name
+        });
 
-            // 定义excel写入单行函数
-            let mut add_excel_row =
-                |col1: String, col2: String, col3: String, col4: String, col5: String| {
-                    worksheet.write_string(excel_row_index, 0, col1).unwrap();
-                    worksheet.write_string(excel_row_index, 1, col2).unwrap();
-                    worksheet.write_string(excel_row_index, 2, col3).unwrap();
-                    worksheet.write_string(excel_row_index, 3, col4).unwrap();
-                    worksheet.write_string(excel_row_index, 4, col5).unwrap();
+        // 当前表
+        let curr_tbl = current.table_infos.iter().find(|t| {
+            let table_name = t.table_name.to_lowercase();
+            tbl.to_lowercase() == table_name
+        });
 
-                    // 行号+1
-                    excel_row_index += 1;
-                };
-
-            // 写入表头
-            add_excel_row(
-                "数据库".into(),
-                "表名".into(),
-                "列名".into(),
-                "比较结果".into(),
-                "比较信息".into(),
-            );
-
-            // 比较每个表
-            for table_name in union_table_names {
-                // 从数据文件中读取的表信息
-                let cached_table_info = cached_db_info
-                    .table_infos
+        match (cached_tbl, curr_tbl) {
+            // 两张表都存在
+            (Some(c), Some(n)) => {
+                // 只要一个列在2侧列中任意一个存在，就参与比较
+                let all_cols: HashSet<_> = c
+                    .col_infos
                     .iter()
-                    .find_or_first(|a| a.table_name == table_name)
-                    .cloned();
+                    .chain(n.col_infos.iter())
+                    .map(|c| &c.col_name)
+                    .collect();
 
-                // 当前数据库中当前表的信息
-                let current_table_info = current_db_info
-                    .table_infos
-                    .iter()
-                    .find_or_first(|a| a.table_name == table_name)
-                    .cloned();
-
-                // 如果两方有一方表缺失
-                if (current_table_info.is_none() && cached_table_info.is_some())
-                    || (current_table_info.is_some() && cached_table_info.is_none())
-                {
-                    // 将表缺失信息保存到excel中
-                    add_excel_row(
-                        db_name.clone(),
-                        table_name.clone(),
-                        "".into(),
-                        "失败".into(),
-                        "表缺失".into(),
-                    );
-                }
-                // 当表都存在
-                else if current_table_info.is_some() && cached_table_info.is_some() {
-                    // 比较列信息
-                    let cached_col_infos = cached_table_info.unwrap().col_infos;
-                    let current_col_infos = current_table_info.unwrap().col_infos;
-
-                    // 取列的 union
-                    let mut union_col_names = HashSet::new();
-                    for col_infos in [&cached_col_infos, &current_col_infos] {
-                        for col_info in col_infos {
-                            union_col_names.insert(col_info.col_name.clone());
+                // 循环每个要比较的列
+                for col in all_cols {
+                    let cached_col = c.col_infos.iter().find(|x| {
+                        let col_name = x.col_name.to_lowercase();
+                        col_name == col.to_lowercase()
+                    });
+                    let curr_col = n.col_infos.iter().find(|x| {
+                        let col_name = x.col_name.to_lowercase();
+                        col_name == col.to_lowercase()
+                    });
+                    match (cached_col, curr_col) {
+                        (Some(old), Some(new)) if old.col_type == new.col_type => {
+                            write_row(&db_name, tbl, col, "成功", "");
                         }
-                    }
-
-                    // 循环检查每个列
-                    for col_name in union_col_names {
-                        // 分别基于列名称查找当前数据库中和缓存表中的列信息
-                        let cached_col_info = cached_col_infos
-                            .iter()
-                            .find(|a| &a.col_name == &col_name)
-                            .cloned();
-                        let current_col_info = current_col_infos
-                            .iter()
-                            .find(|a| &a.col_name == &col_name)
-                            .cloned();
-
-                        // 如果当前列在缓存表中存在，但是在当前表中不存在或者反之
-                        if (cached_col_info.is_some() && current_col_info.is_none())
-                            || (cached_col_info.is_none() && current_col_info.is_some())
-                        {
-                            // 将列缺失信息保存到excel中
-                            add_excel_row(
-                                db_name.clone(),
-                                table_name.clone(),
-                                col_name.clone(),
-                                "失败".into(),
-                                "列缺失".into(),
+                        (Some(old), Some(new)) => {
+                            write_row(
+                                &db_name,
+                                tbl,
+                                col,
+                                "失败",
+                                &format!("列定义不一致{} --> {}", old.col_type, new.col_type),
                             );
                         }
-                        // 如果当前列在缓存表和当前表中都存在，则检查列是否相同(比较类型)
-                        else if cached_col_info.is_some() && current_col_info.is_some() {
-                            // 读取列的类型信息
-                            let cached_col_type = cached_col_info.unwrap().col_type;
-                            let current_col_type = current_col_info.unwrap().col_type;
 
-                            // 列一致
-                            if cached_col_type == current_col_type {
-                                add_excel_row(
-                                    db_name.clone(),
-                                    table_name.clone(),
-                                    col_name.clone(),
-                                    "成功".into(),
-                                    "".into(),
+                        (Some(_), None) => {
+                            write_row(&db_name, tbl, col, "失败", "列缺失");
+
+                            // 如果需要添加修复列sql
+                            if fix_lost_cols {
+                                let table_name = curr_tbl.unwrap().table_name.clone();
+                                let col_name = cached_col.unwrap().col_name.clone();
+                                let col_type = cached_col.unwrap().col_type.clone();
+
+                                let sql = format!(
+                                    "alter table {table_name} add column {col_name} {col_type};"
                                 );
-                            } else {
-                                // 列不一致
-                                add_excel_row(
-                                    db_name.clone(),
-                                    table_name.clone(),
-                                    col_name.clone(),
-                                    "失败".into(),
-                                    format!("列定义不一致{cached_col_type} --> {current_col_type}"),
-                                );
+
+                                fix_cols_sqls.push(sql);
                             }
                         }
+
+                        (None, Some(_)) => {
+                            write_row(&db_name, tbl, col, "失败", "列新增");
+                        }
+
+                        _ => {}
                     }
                 }
             }
 
-            // 将文件保存到当路径
-            wb.save(output_dir.clone()).unwrap();
+            // 缓存表存在，当前表不存在
+            (Some(_), None) => write_row(&db_name, tbl, "", "失败", "表缺失"),
 
-            println!("output result file: {}", output_dir);
+            // 缓存表不存在，当前表存在
+            (None, Some(_)) => write_row(&db_name, tbl, "", "失败", "表新增"),
+
+            // 其他
+            _ => write_row(&db_name, tbl, "", "失败", "双侧缺失"),
         }
-
-        Err(e) => println!("数据文件读取错误: {e}"),
     }
+
+    // 保存对比结果
+    wb.save(output_xlsx).unwrap();
+
+    // 如果有  fix_cols_sqls
+    if fix_lost_cols {
+        fs::write("./path-cols.sql", fix_cols_sqls.join("\n")).expect("生成修补列sql失败");
+    }
+    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 读取启动参数
+/* ---------- 主入口 ---------- */
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 如果是创建本地缓存模式
+    println!("config is: {:#?}", args);
+
+    // 生成文件模式
     if args.create {
-        // 如果是创建数据缓存信息，则默认为 48 mysql
-        let db_host = if args.host.is_empty() {
-            "10.31.7.48".into()
+        let host = if args.host.is_empty() {
+            "10.31.79.48".into()
         } else {
             args.host
         };
-        let db_port = if args.port == 0 { 3306 } else { args.port };
-        let db_user = if args.user.is_empty() {
+        let port = if args.port == 0 { 3306 } else { args.port };
+        let user = if args.user.is_empty() {
             "chkd".into()
         } else {
             args.user
         };
-        let db_pass = if args.password.is_empty() {
+        let password = if args.password.is_empty() {
             "Chkd@146.48".into()
         } else {
             args.password
         };
-        let db_db = if args.database.is_empty() {
+        let database = if args.database.is_empty() {
             "yyws_xyzl_view".into()
         } else {
             args.database
         };
 
-        // 保存到的文件
-        let save_to_file = if args.output_file.is_empty() {
-            "dbInfo.bin".into()
+        let encoded_pw = encode_str(&password);
+        let url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            user, encoded_pw, host, port, database
+        );
+        println!("using connecting str: {}", url);
+
+        let pool = Pool::new(url.as_str());
+
+        let out = if args.output_file.is_empty() {
+            "dbInfo.bin"
         } else {
-            args.output_file
+            &args.output_file
         };
+        create_db_info(&pool, database, out.into()).await?;
+        println!("db info save @ {}", out);
 
-        // 编码密码
-        let db_pass = encode_str(db_pass.as_str());
-
-        // 连接字符串
-        let con_str = format!("mysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_db}");
-
-        // 打印连接字符串
-        println!("using connecting str: {}", con_str);
-
-        // 创建连接池
-        let pool = Pool::new(con_str.as_str())?;
-
-        // 获取连接
-        let mut con = pool.get_conn()?;
-
-        // 创建本缓存
-        create_db_info(&mut con, db_db.clone(), save_to_file.clone().into());
-
-        // 输出完成信息
-        println!("db info save @ {}", save_to_file);
-
-        return Ok(());
-    } else if
-    // 如果是验证模式，默认使用本地连接
-    args.validate {
-        let db_host = if args.host.is_empty() {
+        // 释放连接池
+        pool.disconnect().await?;
+    }
+    // 验证模式
+    else if args.validate {
+        let host = if args.host.is_empty() {
             "localhost".into()
         } else {
             args.host
         };
-        let db_port = if args.port == 0 { 3306 } else { args.port };
-        let db_user = if args.user.is_empty() {
+        let port = if args.port == 0 { 3306 } else { args.port };
+        let user = if args.user.is_empty() {
             "yywsxyzl".into()
         } else {
             args.user
         };
-        let db_pass = if args.password.is_empty() {
+        let password = if args.password.is_empty() {
             "xyzl2@24".into()
         } else {
             args.password
         };
-        let db_db = if args.database.is_empty() {
+        let database = if args.database.is_empty() {
             "yyws_xyzl_view".into()
         } else {
             args.database
         };
 
-        // 读取哈希的文件
-        let input_file = if args.input_file.is_empty() {
-            "dbInfo.bin".into()
-        } else {
-            args.input_file
-        };
+        let encoded_pw = encode_str(&password);
+        let url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            user, encoded_pw, host, port, database
+        );
+        println!("using connecting str: {}", url);
 
-        // 保存到的文件
-        let save_to_file = if args.output_file.is_empty() {
+        let pool = Pool::new(url.as_str());
+
+        let cache = if args.input_file.is_empty() {
+            "dbInfo.bin"
+        } else {
+            &args.input_file
+        };
+        let out = if args.output_file.is_empty() {
             "validateResult.xlsx".into()
+        } else if Regex::new(r"\.xlsx$").unwrap().is_match(&args.output_file) {
+            args.output_file
         } else {
-            // 如果指定了输出文件，验证输入文件名必须是 .xlsx结尾
-            let reg = Regex::new(r"\.xlsx$")?;
-
-            if reg.is_match(args.output_file.as_str()) {
-                args.output_file
-            } else {
-                println!(
-                    "指定输出文件格式不正确，必须以 .xlsx结尾，使用默认输出文件名 validateResult.xlsx"
-                );
-                "validateResult.xlsx".into()
-            }
+            println!("指定输出文件格式不正确，使用默认 validateResult.xlsx");
+            "validateResult.xlsx".into()
         };
 
-        // 编码密码
-        let db_pass = encode_str(db_pass.as_str());
+        // 是否修复丢失的列
+        let fix_lost_cols = args.fix_lost_cols;
 
-        // 连接字符串
-        let con_str = format!("mysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_db}");
+        validate_db_info(&pool, database, cache.into(), out.clone(), fix_lost_cols).await?;
+        println!("output result file: {}", out);
 
-        // 打印连接字符串
-        println!("using connecting str: {}", con_str);
-
-        // 创建连接池
-        let pool = Pool::new(con_str.as_str())?;
-
-        // 获取可用连接
-        let mut con = pool.get_conn()?;
-
-        // 验证数据库信息
-        validate_db_info(&mut con, db_db, input_file, save_to_file);
-        return Ok(());
+        // 释放连接池
+        pool.disconnect().await?;
     }
 
     Ok(())
