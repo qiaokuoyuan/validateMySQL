@@ -24,6 +24,9 @@ struct Args {
     #[arg(short, long, default_value_t = false, help = "基于缓存验证标结构模式")]
     validate: bool,
 
+    #[arg(short, long, default_value_t = false, help = "验证sql模式")]
+    execute_sql: bool,
+
     #[arg(short = 'H', long, default_value = "", help = "MySQL 主机地址")]
     host: String,
 
@@ -258,12 +261,48 @@ async fn validate_db_info(
     Ok(())
 }
 
+async fn execute_sql_list(pool: &Pool, sql_list: &[&str], output_xlsx: &str) -> Result<()> {
+    let mut conn = pool.get_conn().await?;
+
+    // 定义写入的 excel
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    let mut row = 0;
+
+    // 定义写入 excel 方法
+    let mut write_row = |c1: &str, c2: &str| {
+        ws.write_string(row, 0, c1).unwrap();
+        ws.write_string(row, 1, c2).unwrap();
+        row += 1;
+    };
+
+    // 写入表头
+    write_row("SQL", "执行结果");
+
+    // 比较每一张表
+    for sql in sql_list {
+        // 指定sql
+        let rst = conn.query::<Row, &str>(sql).await?;
+
+        // 将返回值保存到excel
+        let rst = format!("{:?}", rst);
+
+        // 写入行信息
+        write_row(sql, rst.as_str());
+    }
+
+    // 保存对比结果
+    wb.save(output_xlsx).unwrap();
+
+    Ok(())
+}
+
 /* ---------- 主入口 ---------- */
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!("config is: {:#?}", args);
+    println!("指定配置项: {:#?}", args);
 
     // 生成文件模式
     if args.create {
@@ -294,7 +333,7 @@ async fn main() -> Result<()> {
             "mysql://{}:{}@{}:{}/{}",
             user, encoded_pw, host, port, database
         );
-        println!("using connecting str: {}", url);
+        println!("使用连接字符串: {}", url);
 
         let pool = Pool::new(url.as_str());
 
@@ -304,7 +343,7 @@ async fn main() -> Result<()> {
             &args.output_file
         };
         create_db_info(&pool, database, out.into()).await?;
-        println!("db info save @ {}", out);
+        println!("表结构快照存储到：{}", out);
 
         // 释放连接池
         pool.disconnect().await?;
@@ -338,7 +377,7 @@ async fn main() -> Result<()> {
             "mysql://{}:{}@{}:{}/{}",
             user, encoded_pw, host, port, database
         );
-        println!("using connecting str: {}", url);
+        println!("使用连接字符串: {}", url);
 
         let pool = Pool::new(url.as_str());
 
@@ -360,11 +399,81 @@ async fn main() -> Result<()> {
         let fix_lost_cols = args.fix_lost_cols;
 
         validate_db_info(&pool, database, cache.into(), out.clone(), fix_lost_cols).await?;
-        println!("output result file: {}", out);
+        println!("输出文件: {}", out);
 
         // 释放连接池
         pool.disconnect().await?;
     }
+    // 检查sql模式
+    else if args.execute_sql {
+        // 指定的需要验证sql文件
+        let sql_file_dir = args.input_file.as_str();
 
+        // 验证指定了文件名
+        if sql_file_dir.is_empty() {
+            println!("必须指定包含待验证sql的路径");
+            return Ok(());
+        }
+
+        // 验证要验证的sql文件是否存在
+        if !fs::exists(sql_file_dir)? {
+            println!("指定sql文件路径[{}]有误", sql_file_dir);
+            return Ok(());
+        } else {
+            // 验证sql模式下要执行sql的主机配置
+            let host = if args.host.is_empty() {
+                "localhost".into()
+            } else {
+                args.host
+            };
+            let port = if args.port == 0 { 3306 } else { args.port };
+            let user = if args.user.is_empty() {
+                "yywsxyzl".into()
+            } else {
+                args.user
+            };
+            let password = if args.password.is_empty() {
+                "xyzl2@24".into()
+            } else {
+                args.password
+            };
+            let database = if args.database.is_empty() {
+                "yyws_xyzl_view".into()
+            } else {
+                args.database
+            };
+
+            let output_excel = if args.output_file.is_empty() {
+                "exeSqlRst.xlsx"
+            } else {
+                args.output_file.as_str()
+            };
+
+            let encoded_pw = encode_str(&password);
+            let url = format!(
+                "mysql://{}:{}@{}:{}/{}",
+                user, encoded_pw, host, port, database
+            );
+            println!("使用连接字符串: {}", url);
+
+            let pool = Pool::new(url.as_str());
+
+            // 读取所有sql
+            let sql_list = fs::read_to_string(sql_file_dir)?;
+
+            // 所有的sql
+            let sql_list = sql_list.split(";").collect::<Vec<&str>>();
+
+            // 执行sql并保存结果
+            execute_sql_list(&pool, &sql_list, &output_excel).await?;
+
+            // 释放连接池
+            pool.disconnect().await?;
+
+            println!("sql集执行结果： {}", output_excel);
+        }
+    } else {
+        println!("请至少选择一个模式： -c 创建表结构快照； -v 基于快照验证  -e 执行sql");
+    }
     Ok(())
 }
